@@ -10,6 +10,11 @@ data/
 faers_combined_cleaned.csv
 faers_combined_cleaned_pure_Reactions.csv
 frequent_drugs_ADRs.csv
+Y_train_sparse.npz
+X_train_sparse.npz
+adr_vocabulary.txt
+
+
 
 # Standard safety blocks
 *.csv
@@ -22,7 +27,4 @@ venv/
 .venv/
 .ipynb_checkpoints/
 __pycache__/
-.DS_Storeadr_vocabulary.txt
-adr_vocabulary.txt
-*.npz
 .DS_Store
