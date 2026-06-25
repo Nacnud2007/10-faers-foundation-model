@@ -11,7 +11,7 @@ MAPPING_FILE = '/Users/duncanpark/10-faers-foundation-model/data/processed/drug_
 PATIENT_FILE = '/Users/duncanpark/10-faers-foundation-model/data/processed/faers_combined_cleaned_pure_reactions.csv' 
 CACHE_FILE = 'cid_to_smiles_cache.csv'
 
-# Output configs - NOTE: X is now a sparse .npz file!
+# Output configs
 X_OUTPUT_FILE = 'X_train_sparse.npz'
 Y_OUTPUT_FILE = 'Y_train_sparse.npz'
 ADR_VOCAB_FILE = 'adr_vocabulary.txt'
@@ -99,7 +99,7 @@ with open(ADR_VOCAB_FILE, 'w') as f:
 
 print("Processing rows with strict memory caps...")
 
-# Clean up stale files
+# Clean up
 for f in [X_OUTPUT_FILE, Y_OUTPUT_FILE, TMP_X_ROWS, TMP_X_COLS, TMP_Y_ROWS, TMP_Y_COLS]:
     if os.path.exists(f): os.remove(f)
 
@@ -114,16 +114,14 @@ MAX_DRUGS = 5
 FP_SIZE = 3095
 TOTAL_X_FEATURES = MAX_DRUGS * FP_SIZE # 15,475
 
-# Add an explicit zeros vector to use as padding for empty slots
+# Zeros vector for padding
 name_to_fingerprint['__pad__'] = np.zeros(FP_SIZE, dtype=np.uint8)
 
 for chunk in pd.read_csv(PATIENT_FILE, dtype=str, chunksize=chunk_size_streaming, low_memory=False):
     for idx, row in chunk.iterrows():
-        # 1. Process Drugs (X)
         raw_drugs = [d.strip().lower() for d in str(row[drug_column]).split(',') if d.strip()]
         truncated_drugs = raw_drugs[:MAX_DRUGS]
         
-        # Build the 10,355 vector entry by entry, tracking only where the 1s are
         for slot_idx in range(MAX_DRUGS):
             if slot_idx < len(truncated_drugs):
                 drug = truncated_drugs[slot_idx]
@@ -131,15 +129,12 @@ for chunk in pd.read_csv(PATIENT_FILE, dtype=str, chunksize=chunk_size_streaming
             else:
                 drug_vector = name_to_fingerprint['__pad__']
             
-            # Find index locations of 1s inside this specific 2,071 slot
             one_indices = np.where(drug_vector == 1)[0]
             for local_col in one_indices:
-                # Map local 2071 fingerprint coordinate to the global 10355 width layout
                 global_col = (slot_idx * FP_SIZE) + local_col
                 x_rows_acc.append(lines_processed)
                 x_cols_acc.append(global_col)
         
-        # 2. Process ADR Targets (Y)
         raw_adrs = [a.strip() for a in str(row[target_column]).split(',')]
         for adr in raw_adrs:
             if adr in adr_to_index:
@@ -148,14 +143,12 @@ for chunk in pd.read_csv(PATIENT_FILE, dtype=str, chunksize=chunk_size_streaming
                 
         lines_processed += 1
 
-    # Stream out the coordinates to disk at the end of each chunk block
     with open(TMP_X_ROWS, 'ab') as f_xr, open(TMP_X_COLS, 'ab') as f_xc, open(TMP_Y_ROWS, 'ab') as f_yr, open(TMP_Y_COLS, 'ab') as f_yc:
         np.save(f_xr, np.array(x_rows_acc, dtype=np.int32))
         np.save(f_xc, np.array(x_cols_acc, dtype=np.int32))
         np.save(f_yr, np.array(y_rows_acc, dtype=np.int32))
         np.save(f_yc, np.array(y_cols_acc, dtype=np.int32))
         
-    # Clear the temporary batch trackers
     x_rows_acc, x_cols_acc = [], []
     y_rows_acc, y_cols_acc = [], []
     print(f"   Progress: {lines_processed:,} / 14,806,532 rows logged.")
@@ -171,12 +164,10 @@ X_sparse_matrix = sparse.csr_matrix((final_x_data, (final_x_rows, final_x_cols))
 print(f"Saving sparse features matrix to: {X_OUTPUT_FILE}")
 sparse.save_npz(X_OUTPUT_FILE, X_sparse_matrix)
 
-# Free up memory/disk
 del final_x_rows, final_x_cols, final_x_data, X_sparse_matrix
 os.remove(TMP_X_ROWS)
 os.remove(TMP_X_COLS)
 
-# Finalize Y Sparse Matrix
 final_y_rows = np.load(TMP_Y_ROWS)
 final_y_cols = np.load(TMP_Y_COLS)
 final_y_data = np.ones(len(final_y_rows), dtype=np.uint8)
@@ -185,8 +176,7 @@ Y_sparse_matrix = sparse.csr_matrix((final_y_data, (final_y_rows, final_y_cols))
 print(f"Saving sparse targets matrix to: {Y_OUTPUT_FILE}")
 sparse.save_npz(Y_OUTPUT_FILE, Y_sparse_matrix)
 
-# Clean up remaining temp files
 os.remove(TMP_Y_ROWS)
 os.remove(TMP_Y_COLS)
 
-print("\n Successfully Completed All Rows! ")
+print("\n Successfully Completed All Rows")
