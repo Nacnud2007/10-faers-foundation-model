@@ -1,18 +1,32 @@
 # Ignore massive raw data chunks
 data/
+output/
 
 # Ignore heavy model checkpoints/trained weights
 *.pt
 *.pth
 *.pkl
+*.py[cod]
+*.pyo
 
-# Block the massive raw data sheets
+# Block massive raw data sheets
 faers_combined_cleaned.csv
 faers_combined_cleaned_pure_Reactions.csv
 frequent_drugs_ADRs.csv
 Y_train_sparse.npz
 X_train_sparse.npz
 adr_vocabulary.txt
+src/autoencoder/snapshot.ipynb
+encoder.py
+pseudobulk_perturb.csv
+sciplex.h5ad
+tmp_sparse_coo.h5
+snapshot.ipynb
+compoundinfo_beta.txt
+cp_mean_coeff_mat.tsv
+gene_attribute_edges.txt
+gene_attribute_edges.txt.zip
+
 
 
 
@@ -28,3 +42,4 @@ venv/
 .ipynb_checkpoints/
 __pycache__/
 .DS_Store
+.vscode/
