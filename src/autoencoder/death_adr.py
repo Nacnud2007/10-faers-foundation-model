@@ -157,27 +157,6 @@ def count_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
-def choose_top_adverse_event_columns(adverse_event_matrix: sparse.csr_matrix, top_k: int) -> tuple[np.ndarray, np.ndarray]:
-    if top_k <= 0:
-        raise ValueError("top_k_adrs must be greater than zero.")
-
-    label_counts = np.asarray(adverse_event_matrix.sum(axis=0)).ravel().astype(np.int64, copy=False)
-    nonzero_columns = np.flatnonzero(label_counts)
-
-    if nonzero_columns.size == 0:
-        raise ValueError("No active adverse-event columns were found in Y_train_sparse.npz.")
-
-    if top_k >= nonzero_columns.size:
-        selected_columns = nonzero_columns[np.argsort(label_counts[nonzero_columns])[::-1]]
-    else:
-        candidate_counts = label_counts[nonzero_columns]
-        top_positions = np.argpartition(candidate_counts, -top_k)[-top_k:]
-        selected_columns = nonzero_columns[top_positions]
-        selected_columns = selected_columns[np.argsort(label_counts[selected_columns])[::-1]]
-
-    selected_counts = label_counts[selected_columns]
-    return selected_columns.astype(np.int64, copy=False), selected_counts.astype(np.int64, copy=False)
-
 
 def choose_row_indices(total_rows: int, max_rows: int | None, seed: int) -> np.ndarray:
     if max_rows is None or max_rows >= total_rows:
@@ -291,13 +270,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x-path", type=Path, default=default_x_path)
     parser.add_argument("--y-path", type=Path, default=default_y_path)
     parser.add_argument("--output-dir", type=Path, default=default_output_directory)
-    parser.add_argument("--top-k-adrs", type=int, default=2_048)
     parser.add_argument("--max-rows", type=int, default=4000000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--pos-weight-max", type=float, default=10,
+    parser.add_argument("--pos-weight-max", type=float, default=3.0,
         help="Upper clamp on pos_weight passed to BCEWithLogitsLoss. Lower = fewer false positives, higher = more recall.")
     parser.add_argument("--dropout", type=float, default=0.00)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
@@ -308,13 +286,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=default_latent_dim)
     parser.add_argument("--decoder-hidden-dim", type=int, default=default_decoder_hidden_dim)
     parser.add_argument("--smoke-test", action="store_true", help="Run a single forward pass and exit.")
-    parser.add_argument(
-        "--modified_top_100_adrs",
-        type=Path,
-        default=project_root / "data" / "processed" / "modified_top_100_adrs.csv",
-        help="CSV containing ADR names to train on.",
-    )
-
     parser.add_argument(
         "--adr-vocab",
         type=Path,
@@ -423,71 +394,6 @@ def sweep_thresholds(
     return results, best
 
 
-def evaluate_by_frequency_bucket(
-    y_true: np.ndarray,
-    y_probs: np.ndarray,
-    selected_counts: np.ndarray,
-    threshold: float,
-    n_buckets: int = 3,
-) -> list[dict]:
-    """
-    Splits ADR columns into frequency buckets (rare/medium/common) by their
-    training-set counts and reports precision/recall/F1/AUC-PR per bucket.
-    An aggregate metric across all 2,048 columns can hide a model that does
-    fine on common ADRs while barely detecting rare ones, which is usually
-    the part that actually matters for a signal-detection tool.
-    """
-    from sklearn.metrics import average_precision_score
-
-    bucket_edges = np.quantile(selected_counts, np.linspace(0, 1, n_buckets + 1))
-    bucket_labels = ["rare", "medium", "common"] if n_buckets == 3 else [f"bucket_{i}" for i in range(n_buckets)]
-
-    y_pred = (y_probs > threshold).astype(np.float32)
-    bucket_results: list[dict] = []
-
-    for i in range(n_buckets):
-        low, high = bucket_edges[i], bucket_edges[i + 1]
-        if i == n_buckets - 1:
-            column_mask = (selected_counts >= low) & (selected_counts <= high)
-        else:
-            column_mask = (selected_counts >= low) & (selected_counts < high)
-
-        if not np.any(column_mask):
-            continue
-
-        bucket_true = y_true[:, column_mask]
-        bucket_pred = y_pred[:, column_mask]
-        bucket_probs = y_probs[:, column_mask]
-
-        tp = np.sum((bucket_true == 1) & (bucket_pred == 1))
-        fp = np.sum((bucket_true == 0) & (bucket_pred == 1))
-        fn = np.sum((bucket_true == 1) & (bucket_pred == 0))
-
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
-
-        # AUC-PR is threshold-independent; average it per-column across the bucket,
-        # skipping columns with zero positives in the val split (undefined AUC-PR).
-        auc_pr_scores = []
-        for col in range(bucket_true.shape[1]):
-            if bucket_true[:, col].sum() > 0:
-                auc_pr_scores.append(average_precision_score(bucket_true[:, col], bucket_probs[:, col]))
-        auc_pr = float(np.mean(auc_pr_scores)) if auc_pr_scores else float("nan")
-
-        bucket_results.append({
-            "bucket": bucket_labels[i],
-            "n_columns": int(column_mask.sum()),
-            "count_range": [int(low), int(high)],
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-            "auc_pr": auc_pr,
-        })
-
-    return bucket_results
-
-
 def main() -> None:
     args = parse_args()
 
@@ -516,68 +422,33 @@ def main() -> None:
     print(f"Chemical input width: {chemical_matrix.shape[1]:,}")
     print(f"Raw adverse-event width: {adverse_event_matrix.shape[1]:,}")
 
-    # Choose ADR columns FIRST — we need to know which 83 ADRs we care
-    # about before we can find which rows actually have them.
-    if args.modified_top_100_adrs and args.modified_top_100_adrs.exists():
-        print(f"Loading custom ADR list from {args.modified_top_100_adrs}")
+    # Look up the specific single vocabulary index for Death
+    adr_vocab = args.adr_vocab.read_text().splitlines()
+    adr_to_index = {adr.strip(): i for i, adr in enumerate(adr_vocab)}
 
-        import pandas as pd
+    # Adjust "Death" string if your vocabulary is capitalized differently (e.g., "DEATH")
+    target_adr = "Death" 
+    if target_adr not in adr_to_index:
+        raise ValueError(f"'{target_adr}' not found in vocabulary.")
 
-        df_custom = pd.read_csv(args.modified_top_100_adrs)
-
-        adr_vocab = args.adr_vocab.read_text().splitlines()
-        adr_to_index = {adr: i for i, adr in enumerate(adr_vocab)}
-
-        missing = set(df_custom["ADR"]) - set(adr_to_index)
-
-        if missing:
-            raise ValueError(
-                f"{len(missing)} ADRs were not found in adr_vocabulary.txt.\n"
-                f"Examples: {list(missing)[:10]}"
-            )
-
-        selected_columns = np.array(
-            [adr_to_index[adr] for adr in df_custom["ADR"]],
-            dtype=np.int64,
-        )
-
-        raw_counts = np.asarray(
-            adverse_event_matrix.sum(axis=0)
-        ).ravel().astype(np.int64)
-
-        selected_counts = raw_counts[selected_columns]
-
-    else:
-        # Fallback to standard top-K frequency ranking if no file is provided
-        print(f"No custom list found. Defaulting to top {args.top_k_adrs} ADRs by frequency.")
-        selected_columns, selected_counts = choose_top_adverse_event_columns(
-            adverse_event_matrix, args.top_k_adrs
-        )
+    selected_columns = np.array([adr_to_index[target_adr]], dtype=np.int64)
+    selected_counts = np.asarray(adverse_event_matrix[:, selected_columns].sum(axis=0)).ravel().astype(np.int64)    
 
     print(f"Selected adverse-event outputs for training: {len(selected_columns):,}")
 
     # Find every row in the FULL dataset with at least one selected ADR,
     # BEFORE subsampling — these ADRs are rare, so sampling --max-rows first
     # would only capture a small, proportional slice of the rows that qualify.
-    full_targets = adverse_event_matrix[:, selected_columns]
-    has_any_target_full = np.asarray(full_targets.sum(axis=1)).ravel() > 0
-    qualifying_rows = np.flatnonzero(has_any_target_full)
-    print(
-        f"Rows with at least one of the {len(selected_columns)} target ADRs "
-        f"(full dataset): {len(qualifying_rows):,} / {chemical_matrix.shape[0]:,}"
+    selected_row_indices = choose_row_indices(
+        chemical_matrix.shape[0],
+        args.max_rows,
+        args.seed,
     )
 
-    if args.max_rows is not None and args.max_rows < len(qualifying_rows):
-        rng = np.random.default_rng(args.seed)
-        selected_row_indices = rng.choice(qualifying_rows, size=args.max_rows, replace=False)
-        selected_row_indices.sort()
-    else:
-        selected_row_indices = qualifying_rows
-    print(f"Selected rows for training: {len(selected_row_indices):,}")
-
-    # Every row here already qualifies, so slicing is all that's needed.
     chemical_subset = chemical_matrix[selected_row_indices]
-    adverse_event_subset = adverse_event_matrix[selected_row_indices][:, selected_columns].tocsr()
+    adverse_event_subset = (
+        adverse_event_matrix[selected_row_indices][:, selected_columns]
+    ).tocsr()
 
     train_loader, val_loader, full_dataset = build_dataloaders(
         chemical_subset,
@@ -664,11 +535,11 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = args.output_dir / "drug_adr_encoder.pt"
-    metadata_path = args.output_dir / "drug_adr_encoder.json"
-    latent_path = args.output_dir / "drug_adr_latents.npz"
-    selected_columns_path = args.output_dir / "selected_adr_columns.npy"
-    selected_counts_path = args.output_dir / "selected_adr_counts.npy"
+    checkpoint_path = args.output_dir / "death_adr_encoder.pt"
+    metadata_path = args.output_dir / "death_adr_encoder.json"
+    latent_path = args.output_dir / "death_adr_latents.npz"
+    selected_columns_path = args.output_dir / "death_adr_selected_adr_columns.npy"
+    selected_counts_path = args.output_dir / "death_selected_adr_counts.npy"
 
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
@@ -683,17 +554,6 @@ def main() -> None:
         f"Recall={best_threshold_entry['recall']:.4f} | "
         f"F1={best_threshold_entry['f1']:.4f}"
     )
-
-    bucket_results = evaluate_by_frequency_bucket(
-        val_y_true, val_y_probs, selected_counts, best_threshold_entry["threshold"]
-    )
-    print("\nPer-frequency-bucket metrics (at best threshold):")
-    for bucket in bucket_results:
-        print(
-            f"  {bucket['bucket']:>7} (n={bucket['n_columns']:>4}, count_range={bucket['count_range']}) | "
-            f"Precision={bucket['precision']:.4f} | Recall={bucket['recall']:.4f} | "
-            f"F1={bucket['f1']:.4f} | AUC-PR={bucket['auc_pr']:.4f}"
-        )
 
     torch.save(
         {
