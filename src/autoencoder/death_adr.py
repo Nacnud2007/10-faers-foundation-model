@@ -27,7 +27,7 @@ chemical_input_dim = max_drugs * fingerprint_bits
 
 default_slot_embed_dim = 256
 default_chemical_hidden_dim = 1024
-default_latent_dim = 256
+default_latent_dim = 512
 default_decoder_hidden_dim = 1024
 
 
@@ -171,6 +171,54 @@ def choose_row_indices(total_rows: int, max_rows: int | None, seed: int) -> np.n
     return row_indices.astype(np.int64, copy=False)
 
 
+def find_label_positive_indices(adverse_event_matrix: sparse.csr_matrix, column_index: int) -> np.ndarray:
+    '''
+    Returns every row index where the given adverse-event column is nonzero, i.e. every
+    row where the target ADR (Death) was actually reported.
+    '''
+    column = adverse_event_matrix[:, [column_index]].tocsc()
+    positive_rows = np.unique(column.nonzero()[0])
+    return positive_rows.astype(np.int64, copy=False)
+
+
+def build_stratified_row_indices(
+    total_rows: int,
+    positive_row_indices: np.ndarray,
+    *,
+    negative_per_positive: float,
+    max_rows: int | None,
+    seed: int,
+) -> np.ndarray:
+    '''
+    Keeps every positive (Death-reporting) row and fills in a matching pool of negative
+    rows at the requested ratio. Plain random sampling over 14.8M rows only captures a
+    small, proportional slice of the ~666k positives (e.g. ~180k out of 666k at
+    max_rows=4,000,000); this keeps them all so the rare positive class isn't thrown away.
+    If max_rows still forces a cut, positives are kept in full and only negatives are thinned.
+    '''
+    random_generator = np.random.default_rng(seed)
+
+    positive_row_indices = np.unique(positive_row_indices)
+    negative_mask = np.ones(total_rows, dtype=bool)
+    negative_mask[positive_row_indices] = False
+    negative_pool = np.flatnonzero(negative_mask)
+
+    n_negatives_wanted = int(round(len(positive_row_indices) * negative_per_positive))
+    n_negatives = min(n_negatives_wanted, len(negative_pool))
+    negative_row_indices = random_generator.choice(negative_pool, size=n_negatives, replace=False)
+
+    if max_rows is not None and max_rows < len(positive_row_indices) + len(negative_row_indices):
+        n_negatives_capped = max(0, max_rows - len(positive_row_indices))
+        if n_negatives_capped < len(negative_row_indices):
+            negative_row_indices = random_generator.choice(
+                negative_row_indices, size=n_negatives_capped, replace=False
+            )
+
+    combined = np.concatenate([positive_row_indices, negative_row_indices])
+    combined.sort()
+    return combined.astype(np.int64, copy=False)
+
+
 def split_indices(total_rows: int, validation_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     if total_rows < 2:
         raise ValueError("Need at least two rows to split into train and validation sets.")
@@ -270,8 +318,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x-path", type=Path, default=default_x_path)
     parser.add_argument("--y-path", type=Path, default=default_y_path)
     parser.add_argument("--output-dir", type=Path, default=default_output_directory)
-    parser.add_argument("--max-rows", type=int, default=4000000)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--max-rows", type=int, default=None,
+        help="Optional hard cap on total training rows. Positives are always kept in full; "
+             "only negatives get thinned if this cap forces a cut. Default: no cap "
+             "(use every positive plus --neg-per-pos-ratio negatives).")
+    parser.add_argument("--neg-per-pos-ratio", type=float, default=4.0,
+        help="Number of negative (non-Death) rows to sample per positive (Death) row. "
+             "With ~666k Death-positive rows, a ratio of 4.0 yields ~3.3M training rows "
+             "with a ~20%% positive rate, instead of the <5%% positive rate you'd get "
+             "from a blind random sample of the full 14.8M rows.")
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -284,7 +340,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-embed-dim", type=int, default=default_slot_embed_dim)
     parser.add_argument("--chemical-hidden-dim", type=int, default=default_chemical_hidden_dim)
     parser.add_argument("--latent-dim", type=int, default=default_latent_dim)
-    parser.add_argument("--decoder-hidden-dim", type=int, default=default_decoder_hidden_dim)
+    parser.add_argument("--decoder-hidden-dim", type=int, default=64,
+        help="Decoder hidden width. The general multi-ADR script defaults to 1024 because it "
+             "outputs thousands of ADR logits; here output_dim=1 (Death only), so a 256->64->1 "
+             "decoder is plenty and trains faster with less overfitting risk.")
     parser.add_argument("--smoke-test", action="store_true", help="Run a single forward pass and exit.")
     parser.add_argument(
         "--adr-vocab",
@@ -435,14 +494,29 @@ def main() -> None:
     selected_counts = np.asarray(adverse_event_matrix[:, selected_columns].sum(axis=0)).ravel().astype(np.int64)    
 
     print(f"Selected adverse-event outputs for training: {len(selected_columns):,}")
+    print(f"Total '{target_adr}' occurrences in full dataset: {int(selected_counts[0]):,}")
 
-    # Find every row in the FULL dataset with at least one selected ADR,
-    # BEFORE subsampling — these ADRs are rare, so sampling --max-rows first
-    # would only capture a small, proportional slice of the rows that qualify.
-    selected_row_indices = choose_row_indices(
+    # Find every row in the FULL dataset with the selected ADR, BEFORE subsampling —
+    # this ADR is rare (~4.5% of rows), so a blind random sample would only capture a
+    # small, proportional slice of the positives. Instead keep every positive row and
+    # sample negatives at a controlled ratio.
+    target_column_index = int(selected_columns[0])
+    positive_row_indices = find_label_positive_indices(adverse_event_matrix, target_column_index)
+    print(f"Rows where '{target_adr}' was reported: {len(positive_row_indices):,}")
+
+    selected_row_indices = build_stratified_row_indices(
         chemical_matrix.shape[0],
-        args.max_rows,
-        args.seed,
+        positive_row_indices,
+        negative_per_positive=args.neg_per_pos_ratio,
+        max_rows=args.max_rows,
+        seed=args.seed,
+    )
+    n_positive_selected = len(positive_row_indices)
+    n_negative_selected = len(selected_row_indices) - n_positive_selected
+    print(
+        f"Stratified training set: {len(selected_row_indices):,} rows "
+        f"({n_positive_selected:,} positive / {n_negative_selected:,} negative, "
+        f"positive rate={100 * n_positive_selected / len(selected_row_indices):.1f}%)"
     )
 
     chemical_subset = chemical_matrix[selected_row_indices]
@@ -589,6 +663,10 @@ def main() -> None:
         "raw_adverse_event_shape": list(adverse_event_matrix.shape),
         "selected_row_count": int(len(selected_row_indices)),
         "selected_adr_count": int(len(selected_columns)),
+        "positive_row_count": int(n_positive_selected),
+        "negative_row_count": int(n_negative_selected),
+        "neg_per_pos_ratio_requested": args.neg_per_pos_ratio,
+        "positive_rate_in_training_set": n_positive_selected / len(selected_row_indices),
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,

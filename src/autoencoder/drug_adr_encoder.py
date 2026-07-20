@@ -27,7 +27,7 @@ chemical_input_dim = max_drugs * fingerprint_bits
 
 default_slot_embed_dim = 256
 default_chemical_hidden_dim = 1024
-default_latent_dim = 256
+default_latent_dim = 512 # test again with 512...pos_weight setting was wrong last time
 default_decoder_hidden_dim = 1024
 
 
@@ -36,7 +36,7 @@ class SharedSlotEmbedder(nn.Module):
     Takes 3,095-bit drug slot and turns it into a dense vector; the same weights
     are reused for all 5 drug slots.
     '''
-    def __init__(self, *, slot_bits: int = fingerprint_bits, embed_dim: int = default_slot_embed_dim, dropout: float = 0.0) -> None:
+    def __init__(self, *, slot_bits: int = fingerprint_bits, embed_dim: int = default_slot_embed_dim, dropout: float = 0.00) -> None:
         super().__init__()
         self.linear = nn.Linear(slot_bits, embed_dim)
         self.activation = nn.ReLU()
@@ -294,13 +294,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-adrs", type=int, default=2_048)
     parser.add_argument("--max-rows", type=int, default=4000000)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--pos-weight-max", type=float, default=10,
         help="Upper clamp on pos_weight passed to BCEWithLogitsLoss. Lower = fewer false positives, higher = more recall.")
-    parser.add_argument("--dropout", type=float, default=0.00)
-    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--slot-embed-dim", type=int, default=default_slot_embed_dim)
