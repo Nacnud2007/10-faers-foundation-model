@@ -138,8 +138,6 @@ def parse_drug_list(
             excluded_drugs.append(drug)
             continue
         drugs.append(drug)
-        if len(drugs) >= max_drugs:
-            break
 
     return drugs, excluded_drugs
 
@@ -387,6 +385,7 @@ def build_patient_profile_indices(
 
     rows_processed = 0
     rows_with_match = 0
+    rows_skipped_too_many_drugs = 0
     drug_slots_seen = 0
     matched_drug_slots = 0
     unmatched_counter: Counter[str] = Counter()
@@ -413,6 +412,10 @@ def build_patient_profile_indices(
                     excluded_terms,
                 )
                 excluded_counter.update(excluded_drugs)
+                if len(drugs) > max_drugs:
+                    rows_skipped_too_many_drugs += 1
+                    continue
+
                 drug_slots_seen += len(drugs)
 
                 for slot_index, raw_drug in enumerate(drugs):
@@ -453,6 +456,7 @@ def build_patient_profile_indices(
     return {
         "patient_rows": rows_processed,
         "rows_with_transcriptomic_match": rows_with_match,
+        "rows_skipped_too_many_drugs": rows_skipped_too_many_drugs,
         "drug_slots_seen": drug_slots_seen,
         "matched_drug_slots": matched_drug_slots,
         "excluded_drug_slots": sum(excluded_counter.values()),

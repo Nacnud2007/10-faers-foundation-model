@@ -291,8 +291,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x-path", type=Path, default=default_x_path)
     parser.add_argument("--y-path", type=Path, default=default_y_path)
     parser.add_argument("--output-dir", type=Path, default=default_output_directory)
-    parser.add_argument("--top-k-adrs", type=int, default=2_048)
-    parser.add_argument("--max-rows", type=int, default=4000000)
+    parser.add_argument("--top-k-adrs", type=int, default=83)
+    parser.add_argument("--max-rows", type=int, default=2000000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -608,6 +608,20 @@ def main() -> None:
         decoder_hidden_dim=args.decoder_hidden_dim,
         dropout = args.dropout
     ).to(device)
+    checkpoint_path = project_root / "output" / "autoencoder" / "chemical_autoencoder" / "chemical_autoencoder.pt"
+    if checkpoint_path.exists():
+        print(f"Loading Step 1 pre-trained encoder from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Extract encoder weights from Step 1
+        encoder_state_dict = {
+            k.replace("encoder.", ""): v 
+            for k, v in checkpoint["model_state_dict"].items() 
+            if k.startswith("encoder.")
+        }
+        model.encoder.load_state_dict(encoder_state_dict)
+        print("Successfully loaded Step 1 chemical encoder weights.")
+
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optimizer = torch.optim.AdamW(
