@@ -1,0 +1,765 @@
+"""
+Trains a chemical encoder that maps drug cocktails to ADR outputs.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from scipy import sparse
+from torch.utils.data import DataLoader, Dataset, Subset
+
+
+project_root = Path(__file__).resolve().parents[2]
+
+default_x_path = project_root / "X_train_sparse.npz"
+default_y_path = project_root / "Y_train_sparse.npz"
+default_output_directory = project_root / "output" / "autoencoder" / "drug_adr_encoder"
+default_adr_vocab = project_root / "adr_vocabulary.txt"
+
+max_drugs = 5
+fingerprint_bits = 3_095
+chemical_input_dim = max_drugs * fingerprint_bits
+
+default_slot_embed_dim = 256
+default_chemical_hidden_dim = 1024
+default_latent_dim = 256
+default_decoder_hidden_dim = 1024
+
+
+class SharedSlotEmbedder(nn.Module):
+    '''
+    Takes 3,095-bit drug slot and turns it into a dense vector; the same weights
+    are reused for all 5 drug slots.
+    '''
+    def __init__(self, *, slot_bits: int = fingerprint_bits, embed_dim: int = default_slot_embed_dim, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.linear = nn.Linear(slot_bits, embed_dim)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, slot_tensor: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.activation(self.linear(slot_tensor)))
+
+
+class DrugEncoder(nn.Module):
+    '''
+    Reshapes the full drug cocktail into five slots, embeds each slot, flattens it, and compresses
+    everything back together into the latent vector
+    '''
+    def __init__(self, *, max_drugs: int = max_drugs,
+        slot_bits: int = fingerprint_bits,
+        slot_embed_dim: int = default_slot_embed_dim,
+        hidden_dim: int = default_chemical_hidden_dim,
+        latent_dim: int = default_latent_dim,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.max_drugs = max_drugs
+        self.slot_bits = slot_bits
+        self.slot_embedder = SharedSlotEmbedder(slot_bits=slot_bits, embed_dim=slot_embed_dim, dropout = dropout)
+        self.chemical_hidden = nn.Linear(max_drugs * slot_embed_dim, hidden_dim)
+        self.latent_layer = nn.Linear(hidden_dim, latent_dim)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, chemical_input: torch.Tensor) -> torch.Tensor:
+        if chemical_input.dim() == 2:
+            chemical_input = chemical_input.reshape(
+                chemical_input.size(0), self.max_drugs, self.slot_bits
+            )
+
+        slot_embeddings = self.slot_embedder(chemical_input)
+        flattened_slots = slot_embeddings.reshape(slot_embeddings.size(0), -1)
+        chemical_hidden = self.dropout(self.activation(self.chemical_hidden(flattened_slots)))
+        return self.activation(self.latent_layer(chemical_hidden))
+
+
+class AdverseEventDecoder(nn.Module):
+    '''
+    Expands the latent vector back into logits for the chosen ADR outputs
+    '''
+    def __init__(
+        self,
+        *,
+        latent_dim: int = default_latent_dim,
+        hidden_dim: int = default_decoder_hidden_dim,
+        output_dim: int,
+        dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.hidden = nn.Linear(latent_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, output_dim)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.output(self.dropout(self.activation(self.hidden(latent))))
+
+
+class DrugToAdverseEventAutoencoder(nn.Module):
+    '''
+    Wraps the encoder and decoder and its forward pass returns the tuple
+    (ADR_logits, latent_vector).
+    '''
+    def __init__(
+        self,
+        *,
+        output_dim: int,
+        slot_embed_dim: int = default_slot_embed_dim,
+        chemical_hidden_dim: int = default_chemical_hidden_dim,
+        latent_dim: int = default_latent_dim,
+        decoder_hidden_dim: int = default_decoder_hidden_dim,
+        dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.encoder = DrugEncoder(
+            slot_embed_dim=slot_embed_dim,
+            hidden_dim=chemical_hidden_dim,
+            latent_dim=latent_dim,
+            dropout = dropout
+        )
+        self.decoder = AdverseEventDecoder(
+            latent_dim=latent_dim,
+            hidden_dim=decoder_hidden_dim,
+            output_dim=output_dim,
+            dropout = dropout
+        )
+
+    def forward(self, chemical_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        latent = self.encoder(chemical_input)
+        logits = self.decoder(latent)
+        return logits, latent
+
+
+class SparseDrugEventDataset(Dataset):
+    '''
+    Loads one row from X_train_sparse.npz and Y_train_sparse.npz and returns dense tensors for training
+    '''
+    def __init__(self, chemical_matrix: sparse.csr_matrix, adverse_event_matrix: sparse.csr_matrix) -> None:
+        self.chemical_matrix = chemical_matrix.tocsr()
+        self.adverse_event_matrix = adverse_event_matrix.tocsr()
+
+    def __len__(self) -> int:
+        return self.chemical_matrix.shape[0]
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        chemical_row = self.chemical_matrix[index].toarray().astype(np.float32, copy=False).ravel()
+        adverse_event_row = self.adverse_event_matrix[index].toarray().astype(np.float32, copy=False).ravel()
+        return torch.from_numpy(chemical_row), torch.from_numpy(adverse_event_row)
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def choose_top_adverse_event_columns(adverse_event_matrix: sparse.csr_matrix, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+    if top_k <= 0:
+        raise ValueError("top_k_adrs must be greater than zero.")
+
+    label_counts = np.asarray(adverse_event_matrix.sum(axis=0)).ravel().astype(np.int64, copy=False)
+    nonzero_columns = np.flatnonzero(label_counts)
+
+    if nonzero_columns.size == 0:
+        raise ValueError("No active adverse-event columns were found in Y_train_sparse.npz.")
+
+    if top_k >= nonzero_columns.size:
+        selected_columns = nonzero_columns[np.argsort(label_counts[nonzero_columns])[::-1]]
+    else:
+        candidate_counts = label_counts[nonzero_columns]
+        top_positions = np.argpartition(candidate_counts, -top_k)[-top_k:]
+        selected_columns = nonzero_columns[top_positions]
+        selected_columns = selected_columns[np.argsort(label_counts[selected_columns])[::-1]]
+
+    selected_counts = label_counts[selected_columns]
+    return selected_columns.astype(np.int64, copy=False), selected_counts.astype(np.int64, copy=False)
+
+
+def choose_row_indices(total_rows: int, max_rows: int | None, seed: int) -> np.ndarray:
+    if max_rows is None or max_rows >= total_rows:
+        return np.arange(total_rows, dtype=np.int64)
+
+    if max_rows < 2:
+        raise ValueError("max_rows must be at least 2 so the train/validation split works.")
+
+    random_generator = np.random.default_rng(seed)
+    row_indices = random_generator.choice(total_rows, size=max_rows, replace=False)
+    row_indices.sort()
+    return row_indices.astype(np.int64, copy=False)
+
+
+def split_indices(total_rows: int, validation_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    if total_rows < 2:
+        raise ValueError("Need at least two rows to split into train and validation sets.")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1.")
+
+    random_generator = np.random.default_rng(seed)
+    permutation = random_generator.permutation(total_rows)
+
+    validation_rows = max(1, int(round(total_rows * validation_fraction)))
+    if validation_rows >= total_rows:
+        validation_rows = total_rows - 1
+
+    validation_indices = permutation[:validation_rows]
+    training_indices = permutation[validation_rows:]
+    return training_indices.astype(np.int64, copy=False), validation_indices.astype(np.int64, copy=False)
+
+
+def build_dataloaders(
+    chemical_matrix: sparse.csr_matrix,
+    adverse_event_matrix: sparse.csr_matrix,
+    *,
+    batch_size: int,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[DataLoader, DataLoader, SparseDrugEventDataset]:
+    full_dataset = SparseDrugEventDataset(chemical_matrix, adverse_event_matrix)
+    training_indices, validation_indices = split_indices(len(full_dataset), validation_fraction, seed)
+
+    training_subset = Subset(full_dataset, training_indices.tolist())
+    validation_subset = Subset(full_dataset, validation_indices.tolist())
+
+    train_loader = DataLoader(training_subset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(validation_subset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, full_dataset
+
+
+def run_epoch(
+    model: DrugToAdverseEventAutoencoder,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
+
+    total_loss = 0.0
+    total_examples = 0
+
+    for chemical_batch, adverse_event_batch in loader:
+        chemical_batch = chemical_batch.to(device)
+        adverse_event_batch = adverse_event_batch.to(device)
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        logits, _ = model(chemical_batch)
+        loss = criterion(logits, adverse_event_batch)
+
+        if training:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+        batch_size = chemical_batch.size(0)
+        total_loss += loss.item() * batch_size
+        total_examples += batch_size
+
+    return total_loss / max(total_examples, 1)
+
+
+def export_latent_embeddings(
+    model: DrugToAdverseEventAutoencoder,
+    dataset: SparseDrugEventDataset,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    latent_batches: list[np.ndarray] = []
+
+    model.eval()
+    with torch.no_grad():
+        for chemical_batch, _ in loader:
+            chemical_batch = chemical_batch.to(device)
+            _, latent = model(chemical_batch)
+            latent_batches.append(latent.cpu().numpy())
+
+    return np.concatenate(latent_batches, axis=0)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a chemical encoder and adverse-event decoder from the FAERS sparse matrices."
+    )
+    parser.add_argument("--x-path", type=Path, default=default_x_path)
+    parser.add_argument("--y-path", type=Path, default=default_y_path)
+    parser.add_argument("--output-dir", type=Path, default=default_output_directory)
+    parser.add_argument("--top-k-adrs", type=int, default=2_048)
+    parser.add_argument("--max-rows", type=int, default=4000000)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--pos-weight-max", type=float, default=10.0,
+        help="Upper clamp on pos_weight passed to BCEWithLogitsLoss. Lower = fewer false positives, higher = more recall.")
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--slot-embed-dim", type=int, default=default_slot_embed_dim)
+    parser.add_argument("--chemical-hidden-dim", type=int, default=default_chemical_hidden_dim)
+    parser.add_argument("--latent-dim", type=int, default=default_latent_dim)
+    parser.add_argument("--decoder-hidden-dim", type=int, default=default_decoder_hidden_dim)
+    parser.add_argument("--smoke-test", action="store_true", help="Run a single forward pass and exit.")
+    parser.add_argument(
+        "--modified_top_100_adrs",
+        type=Path,
+        default=project_root / "data" / "processed" / "modified_top_100_adrs.csv",
+        help="CSV containing ADR names to train on.",
+    )
+
+    parser.add_argument(
+        "--adr-vocab",
+        type=Path,
+        default=default_adr_vocab,
+        help="adr_vocabulary.txt generated when building Y_train_sparse.npz.",
+    )   
+    
+    return parser.parse_args()
+
+def evaluate_predictions(model, loader, device, threshold=0.5):
+    """
+    Evaluates the model on validation data and returns Precision, Recall, and F1-Score.
+    """
+    model.eval()
+    all_targets = []
+    all_preds = []
+    
+    with torch.no_grad():
+        for chemical_batch, adverse_event_batch in loader:
+            chemical_batch = chemical_batch.to(device)
+            logits, _ = model(chemical_batch)
+            
+            # Convert logits to probabilities, then to binary predictions (0 or 1)
+            probs = torch.sigmoid(logits)
+            preds = (probs > threshold).float()
+            
+            all_targets.append(adverse_event_batch.cpu())
+            all_preds.append(preds.cpu())
+            
+    y_true = torch.cat(all_targets, dim=0).numpy()
+    y_pred = torch.cat(all_preds, dim=0).numpy()
+    
+    # Calculate True Positives, False Positives, and False Negatives
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+    
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+    
+    return precision, recall, f1
+
+
+def collect_val_predictions(
+    model: DrugToAdverseEventAutoencoder,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Runs the model once over the validation loader and returns raw probabilities
+    and targets, so the threshold sweep and per-class breakdown below don't each
+    need their own forward pass over the data.
+    """
+    model.eval()
+    all_targets = []
+    all_probs = []
+
+    with torch.no_grad():
+        for chemical_batch, adverse_event_batch in loader:
+            chemical_batch = chemical_batch.to(device)
+            logits, _ = model(chemical_batch)
+            probs = torch.sigmoid(logits)
+
+            all_targets.append(adverse_event_batch.cpu())
+            all_probs.append(probs.cpu())
+
+    y_true = torch.cat(all_targets, dim=0).numpy()
+    y_probs = torch.cat(all_probs, dim=0).numpy()
+    return y_true, y_probs
+
+
+def sweep_thresholds(
+    y_true: np.ndarray,
+    y_probs: np.ndarray,
+    thresholds: np.ndarray | None = None,
+) -> tuple[list[dict], dict]:
+    """
+    Computes precision/recall/F1 at each threshold in `thresholds` and returns
+    the full sweep plus the single entry with the highest F1. A fixed 0.5 cutoff
+    is rarely optimal when most of the 2,048 ADR columns are rare.
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.05, 1.0, 0.05)
+
+    results: list[dict] = []
+    for threshold in thresholds:
+        y_pred = (y_probs > threshold).astype(np.float32)
+        tp = np.sum((y_true == 1) & (y_pred == 1))
+        fp = np.sum((y_true == 0) & (y_pred == 1))
+        fn = np.sum((y_true == 1) & (y_pred == 0))
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+        results.append({
+            "threshold": float(threshold),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        })
+
+    best = max(results, key=lambda entry: entry["f1"])
+    return results, best
+
+
+def evaluate_by_frequency_bucket(
+    y_true: np.ndarray,
+    y_probs: np.ndarray,
+    selected_counts: np.ndarray,
+    threshold: float,
+    n_buckets: int = 3,
+) -> list[dict]:
+    """
+    Splits ADR columns into frequency buckets (rare/medium/common) by their
+    training-set counts and reports precision/recall/F1/AUC-PR per bucket.
+    An aggregate metric across all 2,048 columns can hide a model that does
+    fine on common ADRs while barely detecting rare ones, which is usually
+    the part that actually matters for a signal-detection tool.
+    """
+    from sklearn.metrics import average_precision_score
+
+    bucket_edges = np.quantile(selected_counts, np.linspace(0, 1, n_buckets + 1))
+    bucket_labels = ["rare", "medium", "common"] if n_buckets == 3 else [f"bucket_{i}" for i in range(n_buckets)]
+
+    y_pred = (y_probs > threshold).astype(np.float32)
+    bucket_results: list[dict] = []
+
+    for i in range(n_buckets):
+        low, high = bucket_edges[i], bucket_edges[i + 1]
+        if i == n_buckets - 1:
+            column_mask = (selected_counts >= low) & (selected_counts <= high)
+        else:
+            column_mask = (selected_counts >= low) & (selected_counts < high)
+
+        if not np.any(column_mask):
+            continue
+
+        bucket_true = y_true[:, column_mask]
+        bucket_pred = y_pred[:, column_mask]
+        bucket_probs = y_probs[:, column_mask]
+
+        tp = np.sum((bucket_true == 1) & (bucket_pred == 1))
+        fp = np.sum((bucket_true == 0) & (bucket_pred == 1))
+        fn = np.sum((bucket_true == 1) & (bucket_pred == 0))
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+        # AUC-PR is threshold-independent; average it per-column across the bucket,
+        # skipping columns with zero positives in the val split (undefined AUC-PR).
+        auc_pr_scores = []
+        for col in range(bucket_true.shape[1]):
+            if bucket_true[:, col].sum() > 0:
+                auc_pr_scores.append(average_precision_score(bucket_true[:, col], bucket_probs[:, col]))
+        auc_pr = float(np.mean(auc_pr_scores)) if auc_pr_scores else float("nan")
+
+        bucket_results.append({
+            "bucket": bucket_labels[i],
+            "n_columns": int(column_mask.sum()),
+            "count_range": [int(low), int(high)],
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "auc_pr": auc_pr,
+        })
+
+    return bucket_results
+
+
+def main() -> None:
+    args = parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    print("=" * 72)
+    print("FAERS Chemical Encoder / Adverse-Event Decoder")
+    print("=" * 72)
+
+    chemical_matrix = sparse.load_npz(args.x_path).tocsr()
+    adverse_event_matrix = sparse.load_npz(args.y_path).tocsr()
+
+    if chemical_matrix.shape[0] != adverse_event_matrix.shape[0]:
+        raise ValueError(
+            "Chemical and adverse-event row counts do not match: "
+            f"{chemical_matrix.shape[0]:,} vs {adverse_event_matrix.shape[0]:,}."
+        )
+
+    if chemical_matrix.shape[1] != chemical_input_dim:
+        raise ValueError(
+            f"Expected X to have {chemical_input_dim:,} columns, got {chemical_matrix.shape[1]:,}."
+        )
+
+    print(f"Rows in full dataset: {chemical_matrix.shape[0]:,}")
+    print(f"Chemical input width: {chemical_matrix.shape[1]:,}")
+    print(f"Raw adverse-event width: {adverse_event_matrix.shape[1]:,}")
+
+    # Choose ADR columns FIRST, before picking rows. We need to know which
+    # 83 ADRs we care about before we can find which rows actually have them.
+    if args.modified_top_100_adrs and args.modified_top_100_adrs.exists():
+        print(f"Loading custom ADR list from {args.modified_top_100_adrs}")
+
+        import pandas as pd
+
+        df_custom = pd.read_csv(args.modified_top_100_adrs)
+
+        adr_vocab = args.adr_vocab.read_text().splitlines()
+        adr_to_index = {adr: i for i, adr in enumerate(adr_vocab)}
+
+        missing = set(df_custom["ADR"]) - set(adr_to_index)
+
+        if missing:
+            raise ValueError(
+                f"{len(missing)} ADRs were not found in adr_vocabulary.txt.\n"
+                f"Examples: {list(missing)[:10]}"
+            )
+
+        selected_columns = np.array(
+            [adr_to_index[adr] for adr in df_custom["ADR"]],
+            dtype=np.int64,
+        )
+
+        raw_counts = np.asarray(
+            adverse_event_matrix.sum(axis=0)
+        ).ravel().astype(np.int64)
+
+        selected_counts = raw_counts[selected_columns]
+
+    else:
+        # Fallback to standard top-K frequency ranking if no file is provided
+        print(f"No custom list found. Defaulting to top {args.top_k_adrs} ADRs by frequency.")
+        selected_columns, selected_counts = choose_top_adverse_event_columns(
+            adverse_event_matrix, args.top_k_adrs
+        )
+
+    print(f"Selected adverse-event outputs for training: {len(selected_columns):,}")
+
+    # Now find which rows in the FULL 14.8M dataset have at least one of the
+    # selected ADRs. Doing this before subsampling (instead of after) matters:
+    # these ADRs are rare, so a random --max-rows draw taken first would only
+    # capture a small, proportional slice of the rows that actually qualify.
+    full_targets = adverse_event_matrix[:, selected_columns]
+    has_any_target_full = np.asarray(full_targets.sum(axis=1)).ravel() > 0
+    qualifying_rows = np.flatnonzero(has_any_target_full)
+    print(
+        f"Rows with at least one of the {len(selected_columns)} target ADRs "
+        f"(full dataset): {len(qualifying_rows):,} / {chemical_matrix.shape[0]:,}"
+    )
+
+    # Only subsample down to --max-rows from the qualifying pool. If fewer
+    # rows qualify than --max-rows, we just keep all of them.
+    if args.max_rows is not None and args.max_rows < len(qualifying_rows):
+        rng = np.random.default_rng(args.seed)
+        selected_row_indices = rng.choice(qualifying_rows, size=args.max_rows, replace=False)
+        selected_row_indices.sort()
+    else:
+        selected_row_indices = qualifying_rows
+    print(f"Selected rows for training: {len(selected_row_indices):,}")
+
+    # Slice your matrices in memory. Every row here already has at least one
+    # of the 83 target ADRs, so no further filtering is needed.
+    chemical_subset = chemical_matrix[selected_row_indices]
+    adverse_event_subset = adverse_event_matrix[selected_row_indices][:, selected_columns].tocsr()
+
+    train_loader, val_loader, full_dataset = build_dataloaders(
+        chemical_subset,
+        adverse_event_subset,
+        batch_size=args.batch_size,
+        validation_fraction=args.validation_fraction,
+        seed=args.seed,
+    )
+
+    adverse_event_counts = np.asarray(adverse_event_subset.sum(axis=0)).ravel().astype(np.float32, copy=False)
+    positive_counts = torch.from_numpy(np.maximum(adverse_event_counts, 1.0))
+    negative_counts = float(len(full_dataset)) - positive_counts
+    pos_weight = torch.clamp(negative_counts / positive_counts, min=1.0, max=args.pos_weight_max)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+
+    print(f"Device: {device}")
+
+    model = DrugToAdverseEventAutoencoder(
+        output_dim=len(selected_columns),
+        slot_embed_dim=args.slot_embed_dim,
+        chemical_hidden_dim=args.chemical_hidden_dim,
+        latent_dim=args.latent_dim,
+        decoder_hidden_dim=args.decoder_hidden_dim,
+        dropout = args.dropout
+    ).to(device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+
+    print(f"Model parameters: {count_parameters(model):,}")
+
+    if args.smoke_test:
+        sample_chemical, sample_target = next(iter(train_loader))
+        sample_chemical = sample_chemical.to(device)
+        sample_target = sample_target.to(device)
+        with torch.no_grad():
+            logits, latent = model(sample_chemical)
+            loss = criterion(logits, sample_target)
+        print("Smoke test passed.")
+        print(f"  chemical batch: {tuple(sample_chemical.shape)}")
+        print(f"  latent batch:   {tuple(latent.shape)}")
+        print(f"  output batch:   {tuple(logits.shape)}")
+        print(f"  loss:           {loss.item():.6f}")
+        return
+
+    history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_val_loss = float("inf")
+    epochs_since_improvement = 0
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = run_epoch(model, train_loader, criterion, device, optimizer)
+        val_loss = run_epoch(model, val_loader, criterion, device)
+
+        val_prec, val_rec, val_f1 = evaluate_predictions(model, val_loader, device)
+        
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            epochs_since_improvement = 0
+        else:
+            epochs_since_improvement += 1
+
+        print(
+            f"Epoch {epoch:02d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | "
+            f"Precision={val_prec:.4f} | Recall={val_rec:.4f} | F1-Score={val_f1:.4f}"
+        )
+
+        if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+            print(
+                f"Stopping early: val_loss has not improved for "
+                f"{epochs_since_improvement} epochs (patience={args.early_stopping_patience})."
+            )
+            break
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = args.output_dir / "drug_adr_encoder.pt"
+    metadata_path = args.output_dir / "drug_adr_encoder.json"
+    latent_path = args.output_dir / "drug_adr_latents.npz"
+    selected_columns_path = args.output_dir / "selected_adr_columns.npy"
+    selected_counts_path = args.output_dir / "selected_adr_counts.npy"
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    print("\nRunning final evaluation on best checkpoint...")
+    val_y_true, val_y_probs = collect_val_predictions(model, val_loader, device)
+
+    threshold_sweep, best_threshold_entry = sweep_thresholds(val_y_true, val_y_probs)
+    print(
+        f"Best threshold={best_threshold_entry['threshold']:.2f} | "
+        f"Precision={best_threshold_entry['precision']:.4f} | "
+        f"Recall={best_threshold_entry['recall']:.4f} | "
+        f"F1={best_threshold_entry['f1']:.4f}"
+    )
+
+    bucket_results = evaluate_by_frequency_bucket(
+        val_y_true, val_y_probs, selected_counts, best_threshold_entry["threshold"]
+    )
+    print("\nPer-frequency-bucket metrics (at best threshold):")
+    for bucket in bucket_results:
+        print(
+            f"  {bucket['bucket']:>7} (n={bucket['n_columns']:>4}, count_range={bucket['count_range']}) | "
+            f"Precision={bucket['precision']:.4f} | Recall={bucket['recall']:.4f} | "
+            f"F1={bucket['f1']:.4f} | AUC-PR={bucket['auc_pr']:.4f}"
+        )
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": {
+                "slot_embed_dim": args.slot_embed_dim,
+                "chemical_hidden_dim": args.chemical_hidden_dim,
+                "latent_dim": args.latent_dim,
+                "decoder_hidden_dim": args.decoder_hidden_dim,
+                "output_dim": len(selected_columns),
+            },
+        },
+        checkpoint_path,
+    )
+
+    latent_embeddings = export_latent_embeddings(
+        model, full_dataset, device=device, batch_size=args.batch_size
+    )
+    np.savez_compressed(
+        latent_path,
+        latent_embeddings=latent_embeddings,
+        selected_row_indices=selected_row_indices,
+        selected_adr_columns=selected_columns,
+    )
+    np.save(selected_columns_path, selected_columns)
+    np.save(selected_counts_path, selected_counts)
+
+    metadata = {
+        "x_path": str(args.x_path),
+        "y_path": str(args.y_path),
+        "output_dir": str(args.output_dir),
+        "raw_chemical_shape": list(chemical_matrix.shape),
+        "raw_adverse_event_shape": list(adverse_event_matrix.shape),
+        "selected_row_count": int(len(selected_row_indices)),
+        "selected_adr_count": int(len(selected_columns)),
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "validation_fraction": args.validation_fraction,
+        "seed": args.seed,
+        "history": history,
+        "checkpoint_path": str(checkpoint_path),
+        "latent_path": str(latent_path),
+        "selected_columns_path": str(selected_columns_path),
+        "selected_counts_path": str(selected_counts_path),
+        "best_val_loss": best_val_loss,
+        "final_evaluation": {
+            "threshold_sweep": threshold_sweep,
+            "best_threshold": best_threshold_entry,
+            "frequency_buckets": bucket_results,
+        },
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+
+    print("\nSaved artifacts:")
+    print(f"  checkpoint: {checkpoint_path}")
+    print(f"  metadata:   {metadata_path}")
+    print(f"  latents:    {latent_path}")
+    print(f"  columns:    {selected_columns_path}")
+    print(f"  counts:     {selected_counts_path}")
+
+
+if __name__ == "__main__":
+    main()

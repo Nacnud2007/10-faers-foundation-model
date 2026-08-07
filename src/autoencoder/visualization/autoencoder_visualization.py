@@ -19,6 +19,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -30,6 +31,11 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from autoencoder import (
     BimodalDataset,
@@ -45,7 +51,6 @@ from autoencoder import (
 )
 from drug_adr_encoder import evaluate_by_frequency_bucket, split_indices, sweep_thresholds
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "output" / "models" / "adr_predictor" / "best_val.pt"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "models" / "adr_predictor" / "analysis"
 
@@ -256,6 +261,12 @@ def make_figure(bucket_results: list[dict], sweep_rows: list[dict], best: dict, 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     if not bucket_df.empty:
+        def bucket_metric_error(score: float, support: int) -> float:
+            """Approximate a standard error for display purposes."""
+            support = max(int(support), 1)
+            score = float(np.clip(score, 0.0, 1.0))
+            return float(np.sqrt(max(score * (1.0 - score), 1e-6) / support))
+
         melted = bucket_df.melt(
             id_vars=["bucket"],
             value_vars=["precision", "recall", "f1", "auc_pr"],
@@ -267,6 +278,29 @@ def make_figure(bucket_results: list[dict], sweep_rows: list[dict], best: dict, 
         axes[0].set_xlabel("ADR Frequency Bucket")
         axes[0].set_ylabel("Score")
         axes[0].set_ylim(0.0, 1.05)
+
+        metric_order = ["PRECISION", "RECALL", "F1", "AUC_PR"]
+        for container, metric in zip(axes[0].containers, metric_order):
+            for idx, bar in enumerate(container):
+                if idx >= len(bucket_df):
+                    continue
+                row = bucket_df.iloc[idx]
+                support = int(row.get("n_columns", 1))
+                score = float(bar.get_height())
+                if score <= 0:
+                    continue
+                err = bucket_metric_error(score, support)
+                axes[0].errorbar(
+                    bar.get_x() + bar.get_width() / 2,
+                    score,
+                    yerr=err,
+                    fmt="none",
+                    ecolor="#1f1f1f",
+                    elinewidth=1,
+                    capsize=3,
+                    capthick=1,
+                    zorder=3,
+                )
     else:
         axes[0].text(0.5, 0.5, "No bucket results available", ha="center", va="center")
         axes[0].set_axis_off()
