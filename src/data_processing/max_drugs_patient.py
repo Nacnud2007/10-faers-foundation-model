@@ -1,3 +1,4 @@
+"""Find the maximum number of concurrent drugs reported for a single patient."""
 import pandas as pd
 
 input_file = '/Users/duncanpark/10-faers-foundation-model/data/processed/faers_combined_cleaned_pure_reactions.csv'

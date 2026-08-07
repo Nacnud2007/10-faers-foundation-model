@@ -1,3 +1,4 @@
+"""Remove off-label use terms from the cleaned FAERS dataset."""
 import pandas as pd
 
 INPUT_FILE = "faers_combined_cleaned.csv"

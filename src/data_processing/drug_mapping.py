@@ -1,3 +1,4 @@
+"""Build an initial FAERS drug-name-to-PubChem mapping file."""
 import pandas as pd
 import pubchempy as pcp
 import time

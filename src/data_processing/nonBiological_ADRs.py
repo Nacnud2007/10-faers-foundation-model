@@ -1,3 +1,4 @@
+"""Filter non-reaction terms out of the cleaned FAERS ADR list."""
 import pandas as pd
 
 INPUT_FILE = "faers_combined_cleaned.csv"

@@ -1,3 +1,4 @@
+"""Create a frequency spreadsheet of common drugs and ADRs from FAERS."""
 import pandas as pd
 from collections import Counter
 

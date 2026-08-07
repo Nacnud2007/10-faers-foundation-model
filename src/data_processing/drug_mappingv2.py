@@ -1,3 +1,4 @@
+"""Refine the FAERS drug-name mapping with cleaned PubChem lookups."""
 import pandas as pd
 import pubchempy as pcp
 import re

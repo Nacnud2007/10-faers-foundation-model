@@ -1,3 +1,4 @@
+"""Generate distribution plots for drugs and ADRs in the cleaned FAERS data."""
 import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter

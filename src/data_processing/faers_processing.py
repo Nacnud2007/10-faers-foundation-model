@@ -1,3 +1,4 @@
+"""Process quarterly FAERS ASCII downloads into combined drug and reaction data."""
 import os
 import re
 import pandas as pd
