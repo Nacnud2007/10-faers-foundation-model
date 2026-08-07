@@ -34,6 +34,8 @@ gene_attribute_edges.txt.zip
 *.csv
 *.png
 .DS_Store
+*.npz
+*.npy
 
 # Ignore local system/environment files
 .env
