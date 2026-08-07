@@ -41,7 +41,6 @@ gene_attribute_edges.txt.zip
 .env
 venv/
 .venv/
-.ipynb_checkpoints/
 __pycache__/
 .DS_Store
 .vscode/
