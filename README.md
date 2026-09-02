@@ -1,5 +1,4 @@
 # 10---faers-foundation-model
-Here is a plain-text version without emojis:
 
 ```markdown
 # Multimodal FAERS Foundation Model
